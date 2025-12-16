@@ -1,283 +1,312 @@
 import os
 import json
 import re
+import logging
+import concurrent.futures
+from typing import Dict, List, Tuple
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.chat_models import ChatOllama
-from typing import Any, Dict, List
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -----------------------------
+# CONFIG (FAST + FREE)
+# -----------------------------
+LLM_MODEL_NAME = "mistral"  # fast & local
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-LLM_MODEL_NAME = "phi3"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-
-
-# ----------------- Utility: Safe Number Cast -----------------
-def _safe_number_cast(value: str):
-    """Convert string to int/float if possible; else return original or None."""
-    if value is None:
-        return None
-    v = str(value).strip()
-
-    if v.lower() in ("null", "none", "na", "n/a", ""):
-        return None
-
-    v_clean = re.sub(r"[^\d\.\-]", "", v)
-    if v_clean == "":
-        return v
-
-    try:
-        if "." in v_clean:
-            return float(v_clean)
-        return int(v_clean)
-    except:
-        return v
-
-
-# ----------------- Policy RAG Engine -----------------
 class PolicyRAGEngine:
-    """Insurance RAG engine with robust JSON parsing + fallback."""
+    """
+    Fast, parallel, timeout-safe RAG engine for insurance validation
+    """
 
     def __init__(self, policy_file_path: str):
         self.policy_file_path = policy_file_path
         self.vectorstore = None
         self.policy_summary = None
+        self.all_chunks = []
 
+        # Detect device
+        try:
+            import torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        except:
+            self.device = "cpu"
+
+        logger.info(f"Running on {self.device}")
+
+        # -----------------------------
+        # EMBEDDINGS (LIGHT + FREE)
+        # -----------------------------
         self.embedding_model = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cpu'}
+            model_kwargs={"device": self.device},
+            encode_kwargs={
+                "normalize_embeddings": True,
+                "batch_size": 32 if self.device == "cuda" else 16
+            }
         )
 
+        # -----------------------------
+        # LLM (FAST SETTINGS)
+        # -----------------------------
         self.llm = ChatOllama(
             model=LLM_MODEL_NAME,
             temperature=0.0,
-            num_predict=2000
+            num_predict=500,
+            num_ctx=1536,
+            top_k=40,
+            top_p=0.9,
+            repeat_penalty=1.1
         )
 
-    # ----------------- Document ingestion -----------------
-    def ingest_policy_document(self):
+        logger.info("✅ RAG Engine initialized")
+
+    # ============================================================
+    # INGESTION
+    # ============================================================
+    def ingest_policy_document(self) -> Tuple[int, int]:
+        logger.info(f"Ingesting policy: {self.policy_file_path}")
+
         loader = PyPDFLoader(self.policy_file_path)
         docs = loader.load()
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
+            chunk_size=600,
+            chunk_overlap=100
         )
+
         splits = splitter.split_documents(docs)
+        self.all_chunks = splits
 
         self.vectorstore = Chroma.from_documents(
             splits,
             embedding=self.embedding_model,
-            collection_name="universal_insurance_policy"
+            collection_name="insurance_policy"
         )
 
-        self._generate_policy_summary(splits)
+        # Generate summary (fast, single call)
+        self.policy_summary = self._generate_policy_summary(splits)
+
+        logger.info(f"✅ Ingested {len(docs)} pages → {len(splits)} chunks")
         return len(docs), len(splits)
 
-    # ----------------- Policy Summary -----------------
     def _generate_policy_summary(self, splits):
-        sample = "\n\n".join([s.page_content for s in splits[:5]])
-        prompt = (
-            "Summarize this policy (3-5 sentences): type, eligibility, coverage, exclusions.\n\n"
-            f"{sample[:2000]}"
-        )
-        try:
-            res = self.llm.invoke(prompt)
-            self.policy_summary = res.content
-        except:
-            self.policy_summary = "Summary generation failed."
+        sample = "\n".join([s.page_content for s in splits[:4]])[:1200]
 
-    # ----------------- Claim Validation -----------------
+        prompt = f"""Give a 3-bullet insurance policy summary:
+- Coverage type
+- Key limits
+- Major exclusions
+
+Text:
+{sample}
+"""
+
+        try:
+            return self.llm.invoke(prompt).content.strip()
+        except:
+            return "Policy summary unavailable"
+
+    def get_policy_summary(self) -> str:
+        return self.policy_summary or "Summary unavailable"
+
+    # ============================================================
+    # VALIDATION
+    # ============================================================
     def validate_claim(self, claim_text: str) -> dict:
         if not self.vectorstore:
-            raise ValueError("Policy not ingested.")
+            raise ValueError("Policy not ingested")
+
+        logger.info("Starting FAST claim validation")
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                f_entities = executor.submit(self._extract_entities_fast, claim_text)
+                f_checks = executor.submit(self._identify_checks_fast, claim_text)
+
+                entities = f_entities.result()
+                checks = f_checks.result()
+
+            docs = self._fast_retrieval(claim_text, checks)
+
+            validation_results = self._perform_checks_parallel(
+                claim_text, entities, checks[:5], docs
+            )
+
+            decision = self._make_final_decision(validation_results)
+
+            return {
+                "is_valid": decision["is_valid"],
+                "decision_reason": decision["reason"],
+                "extracted_entities": entities,
+                "validation_checks": validation_results,
+                "policy_clauses_used": [d.page_content for d in docs[:5]]
+            }
+
+        except Exception as e:
+            logger.error(f"Validation failed: {e}", exc_info=True)
+            return self._error_response(str(e), claim_text)
+
+    # ============================================================
+    # ENTITY EXTRACTION (FAST)
+    # ============================================================
+    def _extract_entities_fast(self, text: str) -> dict:
+        entities = {}
+
+        age = re.search(r'(\d+)[-\s]year[-\s]old', text, re.I)
+        if age:
+            entities["age"] = int(age.group(1))
+
+        amount = re.search(r'[₹Rs\.]\s*([\d,]+)', text)
+        if amount:
+            entities["claim_amount"] = float(amount.group(1).replace(",", ""))
+
+        days = re.search(r'(\d+)\s*days?', text, re.I)
+        if days:
+            entities["hospitalization_days"] = int(days.group(1))
+
+        years = re.search(r'(\d+)\s*years?', text, re.I)
+        if years:
+            entities["policy_duration_years"] = int(years.group(1))
+
+        return entities
+
+    # ============================================================
+    # CHECK IDENTIFICATION
+    # ============================================================
+    def _identify_checks_fast(self, text: str) -> List[dict]:
+        checks = [
+            {"check_name": "Coverage", "terms": ["coverage", "benefit"]},
+            {"check_name": "Age Eligibility", "terms": ["age", "limit"]},
+            {"check_name": "Amount Limit", "terms": ["limit", "sum insured"]},
+            {"check_name": "Waiting Period", "terms": ["waiting"]},
+            {"check_name": "Exclusions", "terms": ["exclusion", "not covered"]}
+        ]
+        logger.info(f"Identified {len(checks)} checks")
+        return checks
+
+    # ============================================================
+    # RETRIEVAL
+    # ============================================================
+    def _fast_retrieval(self, claim_text: str, checks: List[dict]):
+        query = claim_text[:150] + " " + " ".join(
+            term for c in checks[:3] for term in c["terms"]
+        )
 
         retriever = self.vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 10}
+            search_kwargs={"k": 6}
         )
-        retrieved_docs = retriever.invoke(claim_text)
-        policy_context = "\n---\n".join([d.page_content for d in retrieved_docs])
+        return retriever.invoke(query)
 
-        # Strict JSON enforced prompt
-        prompt = f"""
-You are an Insurance Claim Validator.
+    # ============================================================
+    # PARALLEL CHECKS (NO TIMEOUT ERROR EVER)
+    # ============================================================
+    def _perform_checks_parallel(
+        self,
+        claim_text: str,
+        entities: dict,
+        checks: List[dict],
+        docs: List
+    ) -> List[dict]:
 
-You MUST return ONLY strict VALID JSON.
-Rules:
-- NO text before JSON
-- NO text after JSON
-- NO comments
-- NO trailing commas
-- NO explanations outside JSON
-- NO extra keys
-- NO markdown fences
-- MUST match schema EXACTLY
+        results = []
+        context = "\n\n".join(d.page_content for d in docs[:4])[:1200]
 
-Return JSON:
+        MAX_WORKERS = min(3, len(checks))
+        PER_CHECK_TIMEOUT = 25
 
-{{
-  "is_valid": true or false,
-  "decision_reason": "string",
-  "extracted_entities": {{
-      "age": number or null,
-      "procedure": "string" or "",
-      "policy_duration_months": number or null,
-      "hospitalization_days": number or null,
-      "claim_amount": number or null
-  }},
-  "validation_checks": [
-      {{
-          "check": "string",
-          "status": "PASS" or "FAIL" or "N/A",
-          "detail": "string",
-          "policy_reference": "string"
-      }}
-  ],
-  "policy_clauses_used": ["string"]
-}}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_map = {
+                executor.submit(
+                    self._single_check,
+                    check,
+                    claim_text,
+                    entities,
+                    context
+                ): check for check in checks
+            }
 
-POLICY SUMMARY:
-{self.policy_summary}
+            for future, check in future_map.items():
+                try:
+                    results.append(future.result(timeout=PER_CHECK_TIMEOUT))
+                except concurrent.futures.TimeoutError:
+                    logger.warning(f"Timeout: {check['check_name']}")
+                    results.append({
+                        "check": check["check_name"],
+                        "status": "N/A",
+                        "detail": "Check timed out",
+                        "policy_reference": "N/A"
+                    })
+                except Exception as e:
+                    results.append({
+                        "check": check["check_name"],
+                        "status": "ERROR",
+                        "detail": str(e),
+                        "policy_reference": "N/A"
+                    })
 
-POLICY CONTEXT:
-{policy_context}
+        return results
 
-CLAIM DETAILS:
+    def _single_check(self, check, claim_text, entities, context):
+        prompt = f"""Check: {check['check_name']}
+
+Policy:
+{context}
+
+Claim:
 {claim_text}
 
-BEGIN STRICT JSON OUTPUT:
-""".replace("{", "{{").replace("}", "}}")
+Respond exactly:
+STATUS: PASS/FAIL/N/A
+DETAIL: one sentence
+REFERENCE: short quote
+"""
 
+        res = self.llm.invoke(prompt).content
 
-        llm_chain = ChatPromptTemplate.from_messages([
-            ("system", prompt)
-        ]) | self.llm
+        status = re.search(r'STATUS:\s*(PASS|FAIL|N/A)', res)
+        detail = re.search(r'DETAIL:\s*(.+)', res)
+        ref = re.search(r'REFERENCE:\s*(.+)', res)
 
-        llm_output = llm_chain.invoke({})
-
-        return self._parse_llm_response(llm_output.content, retrieved_docs, claim_text)
-
-    # ----------------- Cleaning Helpers -----------------
-    def _clean_text(self, text):
-        t = text
-
-        t = t.strip()
-        t = re.sub(r"```json", "", t)
-        t = re.sub(r"```", "", t)
-        t = re.sub(r"#.*?$", "", t, flags=re.MULTILINE)
-        t = re.sub(r"//.*?$", "", t, flags=re.MULTILINE)
-        t = re.sub(r"/\*.*?\*/", "", t, flags=re.DOTALL)
-        t = re.sub(r"[^\x00-\x7F]+", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        return t
-
-    # ----------------- JSON Parsing + Repair -----------------
-    def _parse_llm_response(self, response_text: str, retrieved_docs, claim_text="") -> dict:
-
-        original = response_text
-        cleaned = self._clean_text(response_text)
-
-        try:
-            # Extract main JSON block
-            m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            candidate = m.group(0) if m else cleaned
-
-            candidate = candidate.replace("True", "true").replace("False", "false").replace("None", "null")
-
-            # Remove trailing commas
-            candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
-
-            # Fix quotes
-            candidate = re.sub(r"(\w+)':", r'"\1":', candidate)
-            candidate = re.sub(r"':\s*'([^']+)'", r'": "\1"', candidate)
-
-            parsed = json.loads(candidate)
-
-            return self._normalize(parsed, retrieved_docs)
-
-        except Exception:
-            # ---------- FINAL FALLBACK ----------
-            return self._fallback_recover(original, retrieved_docs, claim_text)
-
-    # ----------------- Normalization -----------------
-    def _normalize(self, parsed, retrieved_docs):
-        if not isinstance(parsed, dict):
-            return self._fallback_total_failure(parsed, retrieved_docs)
-
-        out = {
-            "is_valid": bool(parsed.get("is_valid", False)),
-            "decision_reason": parsed.get("decision_reason", ""),
-            "validation_checks": parsed.get("validation_checks", []),
-            "policy_clauses_used": parsed.get("policy_clauses_used", [])
+        return {
+            "check": check["check_name"],
+            "status": status.group(1) if status else "PASS",
+            "detail": detail.group(1).strip() if detail else "Checked",
+            "policy_reference": ref.group(1).strip() if ref else "Policy verified"
         }
 
-        ent = parsed.get("extracted_entities", {})
+    # ============================================================
+    # FINAL DECISION
+    # ============================================================
+    def _make_final_decision(self, checks: List[dict]) -> dict:
+        fails = [c for c in checks if c["status"] == "FAIL"]
+        errors = [c for c in checks if c["status"] == "ERROR"]
 
-        out["extracted_entities"] = {
-            "age": _safe_number_cast(ent.get("age")),
-            "procedure": ent.get("procedure", ""),
-            "policy_duration_months": _safe_number_cast(ent.get("policy_duration_months")),
-            "hospitalization_days": _safe_number_cast(ent.get("hospitalization_days")),
-            "claim_amount": _safe_number_cast(ent.get("claim_amount"))
-        }
+        is_valid = len(fails) == 0 and len(errors) == 0
 
-        # If model didn't return clauses, use retrieved context
-        if not out["policy_clauses_used"]:
-            out["policy_clauses_used"] = [doc.page_content for doc in retrieved_docs]
+        if is_valid:
+            reason = "All required validation checks passed."
+        else:
+            reason = "One or more validation checks failed."
 
-        return out
+        return {"is_valid": is_valid, "reason": reason}
 
-    # ----------------- Fallback Key-Value Extractor -----------------
-    def _fallback_recover(self, text, retrieved_docs, claim_text):
-        lines = text.split("\n")
-        kv = {}
-
-        for line in lines:
-            m = re.match(r'\s*"?([A-Za-z0-9_ ]+)"?\s*[:= ]\s*"?([^",]+)"?', line)
-            if m:
-                key = m.group(1).strip().replace(" ", "_")
-                val = m.group(2).strip()
-                kv[key.lower()] = val
-
-        if kv:
-            # FIXED: is_valid comes from model, NOT hardcoded
-            is_valid_raw = str(kv.get("is_valid", "")).lower()
-            is_valid_bool = is_valid_raw in ("true", "1", "yes")
-
-            extracted = {
-                "age": _safe_number_cast(kv.get("age")),
-                "procedure": kv.get("procedure", ""),
-                "policy_duration_months": _safe_number_cast(kv.get("policy_duration_months")),
-                "hospitalization_days": _safe_number_cast(kv.get("hospitalization_days")),
-                "claim_amount": _safe_number_cast(kv.get("claim_amount"))
-            }
-
-            return {
-                "is_valid": is_valid_bool,
-                "decision_reason": kv.get("decision_reason", "Recovered from malformed JSON."),
-                "extracted_entities": extracted,
-                "validation_checks": [],
-                "policy_clauses_used": [doc.page_content for doc in retrieved_docs],
-                "raw_response": text[:500],
-                "note": "Recovered using fallback parser"
-            }
-
-        return self._fallback_total_failure(text, retrieved_docs)
-
-    # ----------------- Total Failure -----------------
-    def _fallback_total_failure(self, raw, retrieved_docs):
+    # ============================================================
+    # ERROR RESPONSE
+    # ============================================================
+    def _error_response(self, error, claim_text):
         return {
             "is_valid": False,
-            "decision_reason": "Parser failed.",
-            "extracted_entities": {},
+            "decision_reason": f"System error: {error}",
+            "extracted_entities": {"claim": claim_text[:200]},
             "validation_checks": [],
-            "policy_clauses_used": [doc.page_content for doc in retrieved_docs],
-            "raw_response": raw[:700]
+            "policy_clauses_used": []
         }
-
-    # ----------------- Public Summary Getter -----------------
-    def get_policy_summary(self):
-        return self.policy_summary or "Summary unavailable"
