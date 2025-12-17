@@ -4,30 +4,18 @@ import requests
 import os
 import time
 
-# -------------------------------------------------------------
 # CONFIG - BACKEND URL
-# -------------------------------------------------------------
-# For local development
+# For ngrok development
 BACKEND_URL = "https://candent-shasta-casuistically.ngrok-free.dev"
 
-# For ngrok deployment (update this after starting ngrok)
-# BACKEND_URL = "https://your-ngrok-url.ngrok-free.app"
-
-# For production deployment
-# BACKEND_URL = "https://your-production-backend.com"
-
-# -------------------------------------------------------------
 # Streamlit Config
-# -------------------------------------------------------------
 st.set_page_config(
     layout="wide",
     page_title="AI Insurance Claim Validator",
     page_icon="🛡️"
 )
 
-# -------------------------------------------------------------
-# Custom CSS for better UI
-# -------------------------------------------------------------
+# Custom CSS for better UI-
 st.markdown("""
 <style>
     .main-header {
@@ -67,9 +55,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------------
 # Initialize Session State
-# -------------------------------------------------------------
 if "ingested" not in st.session_state:
     st.session_state.ingested = False
 
@@ -82,9 +68,7 @@ if "policy_summary" not in st.session_state:
 if "validation_history" not in st.session_state:
     st.session_state.validation_history = []
 
-# -------------------------------------------------------------
 # UI Header
-# -------------------------------------------------------------
 st.markdown('<div class="main-header">🛡️ AI Insurance Claim Validator</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Powered by Dynamic RAG | Works with ANY Insurance Policy</div>', unsafe_allow_html=True)
 
@@ -92,16 +76,14 @@ st.markdown('<div class="sub-header">Powered by Dynamic RAG | Works with ANY Ins
 try:
     response = requests.get(f"{BACKEND_URL}/", timeout=2)
     if response.status_code == 200:
-        st.success(f"✅ Connected to backend: {BACKEND_URL}")
+        st.success(f"✅ Connected to backend")
     else:
         st.warning(f"⚠️ Backend responding but with unexpected status: {BACKEND_URL}")
 except:
     st.error(f"❌ Cannot connect to backend: {BACKEND_URL}")
     st.info("💡 Make sure the backend is running: `uvicorn api_server:app --reload`")
 
-# -------------------------------------------------------------
 # Sidebar – Policy Upload
-# -------------------------------------------------------------
 st.sidebar.markdown("## 📄 Step 1: Upload Policy")
 st.sidebar.markdown("Upload any insurance policy PDF (health, auto, home, life, etc.)")
 
@@ -112,9 +94,7 @@ uploaded_file = st.sidebar.file_uploader(
     help="The system will analyze the policy and determine validation requirements automatically"
 )
 
-# -------------------------------------------------------------
 # Policy Ingestion
-# -------------------------------------------------------------
 if uploaded_file and not st.session_state.ingested:
     st.session_state.policy_name = uploaded_file.name
 
@@ -191,9 +171,7 @@ elif st.session_state.ingested:
         st.session_state.validation_history = []
         st.rerun()
 
-# -------------------------------------------------------------
 # Main Content - Claim Validation
-# -------------------------------------------------------------
 st.markdown("---")
 
 if st.session_state.ingested:
@@ -265,9 +243,7 @@ if st.session_state.ingested:
                 st.caption(f"Result: {record['result']}")
                 st.markdown("---")
 
-    # -------------------------------------------------------------
     # Process Claim Validation
-    # -------------------------------------------------------------
     if validate_button and claim_text.strip():
         
         # Add to history
@@ -301,7 +277,16 @@ if st.session_state.ingested:
                     result = resp.json()
                     end_time = time.time()
                     duration = end_time - start_time
-                    
+
+                    # create logs directory
+                    log_dir = "performance_logs"
+                    os.makedirs(log_dir, exist_ok=True)
+
+                    # Save the result to a unique JSON file
+                    import json
+                    log_filename = f"{log_dir}/run_{int(time.time())}.json"
+                    with open(log_filename, "w") as f:
+                        json.dump(result, f)
                     progress_placeholder.empty()
                     
                     # Update history
@@ -335,14 +320,13 @@ if st.session_state.ingested:
                     else:
                         st.error(decision_reason)
 
-                    # -------------------------------------------------------------
                     # Detailed Results in Tabs
-                    # -------------------------------------------------------------
-                    tab1, tab2, tab3, tab4 = st.tabs([
+                    tab1, tab2, tab3, tab4, tab5 = st.tabs([
                         "📋 Extracted Details",
                         "✓ Validation Checks",
                         "📜 Policy References",
-                        "🔧 Raw Data"
+                        "🔧 Raw Data",''
+                        "⚡ Performance"
                     ])
 
                     # Tab 1 - Extracted Entities
@@ -454,6 +438,22 @@ if st.session_state.ingested:
                             file_name=f"validation_result_{int(time.time())}.json",
                             mime="application/json"
                         )
+                    with tab5:
+                        perf_metrics = result.get("performance_metrics", {})
+                        if perf_metrics:
+                            st.markdown("### ⚡ System Performance Metrics")
+                            
+                            # Display the gauges/metrics
+                            m_col1, m_col2, m_col3 = st.columns(3)
+                            m_col1.metric("Total Time", f"{perf_metrics.get('total_time', 0):.2f}s")
+                            m_col2.metric("LLM Calls", perf_metrics.get("llm_calls", 0))
+                            
+                            # Add a simple bar chart of the timing breakdown
+                            timing_data = {k: v for k, v in perf_metrics.items() if k.endswith('_time')}
+                            if timing_data:
+                                st.bar_chart(pd.Series(timing_data))
+                        else:
+                            st.info("Run a validation to see performance metrics here.")
 
             except requests.exceptions.Timeout:
                 st.error("❌ Request timed out. The validation is taking too long.")
@@ -546,18 +546,15 @@ else:
         - Semantic search
         """)
 
-# -------------------------------------------------------------
 # Footer
-# -------------------------------------------------------------
 st.markdown("---")
-st.caption("🤖 Powered by Ollama (Llama 3.1 / Mistral) + LangChain + ChromaDB + Streamlit")
-st.caption(f"Backend: {BACKEND_URL}")
+st.caption("🤖 Powered by Ollama (Mistral) + LangChain + ChromaDB + Streamlit")
+
 
 # Show system info in sidebar
 with st.sidebar:
     st.markdown("---")
     st.markdown("### 📊 System Info")
-    st.caption(f"Backend: {BACKEND_URL}")
     st.caption(f"Model: LLM via Ollama")
     st.caption(f"Embeddings: HuggingFace")
     
