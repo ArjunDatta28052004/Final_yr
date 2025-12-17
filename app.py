@@ -5,8 +5,8 @@ import os
 import time
 
 # CONFIG - BACKEND URL
-# For ngrok development
-BACKEND_URL = "https://candent-shasta-casuistically.ngrok-free.dev"
+# For ngrok development - "https://example.ngrok-free.dev"
+BACKEND_URL = "http://localhost:8000"
 
 # Streamlit Config
 st.set_page_config(
@@ -559,4 +559,5 @@ with st.sidebar:
     st.caption(f"Embeddings: HuggingFace")
     
     if st.session_state.validation_history:
+
         st.caption(f"Validations: {len(st.session_state.validation_history)}")
